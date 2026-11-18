@@ -1,4 +1,4 @@
-"""SQLite storage and online FTS index management.
+"""SQLite storage, online FTS index management and threshold alerting.
 
 The important invariant is that every generation of the search index is a
 separate FTS5 table.  A generation is only switched live after it has indexed
@@ -10,6 +10,15 @@ Writes and activation are serialized with ``BEGIN IMMEDIATE`` (and an
 in-process lock).  Readers pick one generation id and only ever query that
 generation's FTS table; retired tables are kept, so an in-flight search cannot
 observe a half-switched index.
+
+Alerting is evaluated inside the same write transaction as the log insert and
+the FTS updates, so a log row, its index entries and its alert-window effects
+either all commit or all roll back.  A rule only sees logs committed after the
+rule itself committed (``start_log_id`` snapshot at registration).  Hits are
+grouped into non-overlapping windows anchored at the first hit; a window opens
+at most one alert, and acknowledging an alert never re-arms its window — only
+the next window can open a new alert.  Rebuilds only copy rows into a new FTS
+table and never evaluate rules, so reindexing cannot duplicate alerts.
 """
 
 from __future__ import annotations
@@ -20,7 +29,7 @@ import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -60,6 +69,65 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_one_active_generation
     ON index_generations(status) WHERE status = 'active';
 CREATE UNIQUE INDEX IF NOT EXISTS ux_one_building_generation
     ON index_generations(status) WHERE status = 'building';
+
+-- One alert rule per service.  ``start_log_id`` snapshots MAX(logs.id) at
+-- registration inside the same write transaction, so only logs committed
+-- after the rule are ever evaluated.
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    service         TEXT NOT NULL,
+    keyword         TEXT NOT NULL,
+    window_seconds  INTEGER NOT NULL CHECK (window_seconds > 0),
+    threshold       INTEGER NOT NULL CHECK (threshold > 0),
+    created_at      TEXT NOT NULL,
+    start_log_id    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_rules_service
+    ON alert_rules(service);
+
+-- Non-overlapping hit windows per rule, anchored at the first hit:
+-- [window_start, window_end).  ``alerted`` flips to 1 once the window has
+-- opened its single alert.
+CREATE TABLE IF NOT EXISTS alert_windows (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id         INTEGER NOT NULL,
+    window_start    TEXT NOT NULL,
+    window_end      TEXT NOT NULL,
+    first_log_id    INTEGER NOT NULL,
+    last_log_id     INTEGER NOT NULL,
+    hit_count       INTEGER NOT NULL,
+    alerted         INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_windows_first
+    ON alert_windows(rule_id, first_log_id);
+
+-- Alert tickets.  Service/keyword/threshold are denormalized so a ticket
+-- stays meaningful after its rule is deleted.
+CREATE TABLE IF NOT EXISTS alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id         INTEGER NOT NULL,
+    window_id       INTEGER NOT NULL,
+    service         TEXT NOT NULL,
+    keyword         TEXT NOT NULL,
+    threshold       INTEGER NOT NULL,
+    window_seconds  INTEGER NOT NULL,
+    window_start    TEXT NOT NULL,
+    first_log_id    INTEGER NOT NULL,
+    last_log_id     INTEGER NOT NULL,
+    hit_count       INTEGER NOT NULL,
+    opened_at       TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open'
+                    CHECK (status IN ('open', 'ack')),
+    acked_at        TEXT
+);
+
+-- At most one alert per window, no matter how the writes interleave.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_alerts_window
+    ON alerts(window_id);
+CREATE INDEX IF NOT EXISTS idx_alerts_status_id
+    ON alerts(status, id);
 """
 
 
@@ -75,8 +143,30 @@ class BuildAborted(RuntimeError):
     """Raised internally when a build is no longer the current build."""
 
 
+class RuleExists(RuntimeError):
+    """Raised when a service already has an alert rule."""
+
+
+class AlertNotFound(RuntimeError):
+    """Raised when an alert id does not exist."""
+
+
+class AlertAlreadyAcked(RuntimeError):
+    """Raised when an alert was already acknowledged."""
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _shift_time(iso_text: str, seconds: int) -> str:
+    """Add seconds to a timestamp produced by :func:`utcnow`.
+
+    All stored timestamps share one ISO-8601 UTC format, so the shifted
+    result stays lexicographically comparable with them.
+    """
+    moment = datetime.fromisoformat(iso_text)
+    return (moment + timedelta(seconds=seconds)).isoformat(timespec="seconds")
 
 
 def _runs(text: str) -> Iterable[str]:
@@ -139,9 +229,17 @@ def fts_match_expression(text: str) -> str | None:
 class IndexManager:
     """Owns SQLite connections, writes and the rebuild worker."""
 
-    def __init__(self, db_path: str | os.PathLike[str], *, chunk_size: int = 500) -> None:
+    def __init__(
+        self,
+        db_path: str | os.PathLike[str],
+        *,
+        chunk_size: int = 500,
+        now: Callable[[], str] | None = None,
+    ) -> None:
         self.db_path = str(db_path)
         self.chunk_size = max(1, chunk_size)
+        # Clock is injectable so window boundaries can be tested exactly.
+        self._now = now or utcnow
         self._write_lock = threading.RLock()
         self._init_lock = threading.Lock()
         self._initialized = False
@@ -152,6 +250,9 @@ class IndexManager:
         self.build_hook: Callable[[str, dict[str, Any]], None] | None = None
         # Test hook called after a search has picked its generation.
         self.search_hook: Callable[[dict[str, Any]], None] | None = None
+        # Test hook called inside the log-write transaction just before it
+        # commits; raising rolls the whole write (log + index + alert) back.
+        self.write_hook: Callable[[str, dict[str, Any]], None] | None = None
 
     # ------------------------------------------------------------------ setup
     def _connect(self) -> sqlite3.Connection:
@@ -261,7 +362,7 @@ class IndexManager:
                     "    error = ? "
                     "WHERE id = ? AND status = 'building'",
                     (
-                        utcnow(),
+                        self._now(),
                         "进程在重建完成前重启，半成品索引已丢弃",
                         row["id"],
                     ),
@@ -326,7 +427,7 @@ class IndexManager:
                 "(status, created_at, start_id, build_cursor, indexed_through, "
                 " doc_count, fts_table) "
                 "VALUES ('building', ?, ?, 0, 0, 0, ?)",
-                (utcnow(), start_id, table),
+                (self._now(), start_id, table),
             )
             generation_id = int(cursor.lastrowid)
         generation = self._get_generation(generation_id)
@@ -463,7 +564,7 @@ class IndexManager:
                 "SET status = 'active', activated_at = ?, finished_at = ?, "
                 "    indexed_through = ?, doc_count = ? "
                 "WHERE id = ? AND status = 'building'",
-                (utcnow(), utcnow(), max_log_id, total_logs, generation_id),
+                (self._now(), self._now(), max_log_id, total_logs, generation_id),
             )
 
     def _fail_generation(self, generation_id: int, exc: BaseException) -> None:
@@ -479,7 +580,7 @@ class IndexManager:
                         "UPDATE index_generations "
                         "SET status = 'failed', finished_at = ?, error = ? "
                         "WHERE id = ? AND status = 'building'",
-                        (utcnow(), str(exc)[:2000], generation_id),
+                        (self._now(), str(exc)[:2000], generation_id),
                     )
                     table = generation["fts_table"]
         except sqlite3.Error:
@@ -489,9 +590,14 @@ class IndexManager:
 
     # ---------------------------------------------------------------- writes
     def add_log(self, service: str, body: str) -> dict[str, Any]:
-        """Insert a log and index it in both active and building generations."""
+        """Insert a log, index it and evaluate alert rules, atomically.
+
+        The log row, the FTS rows in the active and building generations and
+        any alert-window/alert updates commit in one ``BEGIN IMMEDIATE``
+        transaction: a failure anywhere leaves no one-sided result behind.
+        """
         tokens = " ".join(document_tokens(body))
-        created_at = utcnow()
+        created_at = self._now()
         with self._write_tx() as conn:
             cursor = conn.execute(
                 "INSERT INTO logs(service, body, created_at) VALUES (?, ?, ?)",
@@ -499,7 +605,7 @@ class IndexManager:
             )
             log_id = int(cursor.lastrowid)
             generations = conn.execute(
-                "SELECT id, fts_table FROM index_generations "
+                "SELECT id, status, fts_table FROM index_generations "
                 "WHERE status IN ('active', 'building')"
             ).fetchall()
             for generation in generations:
@@ -515,12 +621,265 @@ class IndexManager:
                     "WHERE id = ?",
                     (log_id, generation["id"]),
                 )
+            self._evaluate_alert_rules(
+                conn,
+                log_id=log_id,
+                service=service,
+                created_at=created_at,
+                generations=generations,
+            )
+            hook = self.write_hook
+            if hook is not None:
+                hook("before_commit", {"log_id": log_id, "service": service})
         return {
             "id": log_id,
             "service": service,
             "body": body,
             "created_at": created_at,
         }
+
+    # ---------------------------------------------------------------- alerts
+    def _evaluate_alert_rules(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        log_id: int,
+        service: str,
+        created_at: str,
+        generations: list[sqlite3.Row],
+    ) -> None:
+        """Count this log against the service's rules and open alerts.
+
+        Runs inside the log's write transaction.  Only rules committed before
+        the log are visible here, and ``start_log_id`` additionally pins the
+        registration snapshot, so "rule vs log" interleavings are decided
+        purely by commit order.
+        """
+        rules = conn.execute(
+            "SELECT * FROM alert_rules WHERE service = ? AND start_log_id < ?",
+            (service, log_id),
+        ).fetchall()
+        if not rules:
+            return
+        # The row was just inserted into every one of these FTS tables with
+        # identical tokens; matching against the active one reuses exactly
+        # the search matching rules.
+        fts_table: str | None = None
+        for generation in generations:
+            if generation["status"] == "active":
+                fts_table = generation["fts_table"]
+                break
+        if fts_table is None and generations:
+            fts_table = generations[0]["fts_table"]
+        if fts_table is None:
+            # Unreachable once initialize() has run: there is always an
+            # active index, and the write above already indexed this row.
+            return
+        for rule in rules:
+            match = fts_match_expression(rule["keyword"])
+            if match is None:
+                continue  # keyword was validated at registration
+            hit = conn.execute(
+                f'SELECT 1 FROM "{fts_table}" '
+                f'WHERE "{fts_table}" MATCH ? AND rowid = ? LIMIT 1',
+                (match, log_id),
+            ).fetchone()
+            if hit:
+                self._record_hit(conn, rule, log_id, created_at)
+
+    def _record_hit(
+        self,
+        conn: sqlite3.Connection,
+        rule: sqlite3.Row,
+        log_id: int,
+        created_at: str,
+    ) -> None:
+        """Add one hit to the rule's current window, opening at most one alert."""
+        rule_id = rule["id"]
+        window = conn.execute(
+            "SELECT * FROM alert_windows WHERE rule_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (rule_id,),
+        ).fetchone()
+        if window is None or created_at >= window["window_end"]:
+            # No window yet, or the previous one expired: this hit anchors a
+            # new non-overlapping window [start, start + window_seconds).
+            window_start = created_at
+            window_end = _shift_time(window_start, rule["window_seconds"])
+            cursor = conn.execute(
+                "INSERT INTO alert_windows "
+                "(rule_id, window_start, window_end, first_log_id, last_log_id, "
+                " hit_count) "
+                "VALUES (?, ?, ?, ?, ?, 1)",
+                (rule_id, window_start, window_end, log_id, log_id),
+            )
+            window_id = int(cursor.lastrowid)
+            first_log_id = log_id
+            hit_count = 1
+            alerted = False
+        else:
+            window_id = window["id"]
+            window_start = window["window_start"]
+            first_log_id = window["first_log_id"]
+            hit_count = window["hit_count"] + 1
+            alerted = bool(window["alerted"])
+            conn.execute(
+                "UPDATE alert_windows SET hit_count = ?, last_log_id = ? "
+                "WHERE id = ?",
+                (hit_count, log_id, window_id),
+            )
+        if hit_count >= rule["threshold"] and not alerted:
+            # One alert per window, enforced again by ux_alerts_window.
+            conn.execute(
+                "INSERT INTO alerts "
+                "(rule_id, window_id, service, keyword, threshold, "
+                " window_seconds, window_start, first_log_id, last_log_id, "
+                " hit_count, opened_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')",
+                (
+                    rule_id,
+                    window_id,
+                    rule["service"],
+                    rule["keyword"],
+                    rule["threshold"],
+                    rule["window_seconds"],
+                    window_start,
+                    first_log_id,
+                    log_id,
+                    hit_count,
+                    created_at,
+                ),
+            )
+            conn.execute(
+                "UPDATE alert_windows SET alerted = 1 WHERE id = ?",
+                (window_id,),
+            )
+
+    def create_rule(
+        self,
+        service: str,
+        keyword: str,
+        window_seconds: int,
+        threshold: int,
+    ) -> dict[str, Any]:
+        """Register one alert rule for a service.
+
+        The rule only processes logs committed after this transaction; the
+        ``start_log_id`` snapshot and the insert commit together.
+        """
+        service = service.strip()
+        keyword = keyword.strip()
+        if not service:
+            raise ValueError("服务名不能为空")
+        if fts_match_expression(keyword) is None:
+            raise ValueError("关键词无法用于检索匹配，请提供文字或数字")
+        if window_seconds < 1:
+            raise ValueError("窗口秒数必须大于 0")
+        if threshold < 1:
+            raise ValueError("触发条数必须大于 0")
+        with self._write_tx() as conn:
+            if conn.execute(
+                "SELECT 1 FROM alert_rules WHERE service = ?", (service,)
+            ).fetchone():
+                raise RuleExists(f"服务 {service} 已登记告警规则，请先删除再重新登记")
+            start_log_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM logs"
+            ).fetchone()[0]
+            cursor = conn.execute(
+                "INSERT INTO alert_rules "
+                "(service, keyword, window_seconds, threshold, created_at, "
+                " start_log_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (service, keyword, window_seconds, threshold, self._now(), start_log_id),
+            )
+            rule_id = int(cursor.lastrowid)
+        rule = self.get_rule(rule_id)
+        assert rule is not None
+        return rule
+
+    def get_rule(self, rule_id: int) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM alert_rules WHERE id = ?", (rule_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_rules(self) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM alert_rules ORDER BY id"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def delete_rule(self, rule_id: int) -> bool:
+        """Delete a rule and its windows; already opened alerts are kept."""
+        with self._write_tx() as conn:
+            cursor = conn.execute(
+                "DELETE FROM alert_rules WHERE id = ?", (rule_id,)
+            )
+            if cursor.rowcount == 0:
+                return False
+            conn.execute(
+                "DELETE FROM alert_windows WHERE rule_id = ?", (rule_id,)
+            )
+        return True
+
+    def list_alerts(
+        self,
+        status: str | None = "open",
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        where = ""
+        params: list[Any] = []
+        if status in ("open", "ack"):
+            where = "WHERE status = ?"
+            params.append(status)
+        conn = self._connect()
+        try:
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM alerts {where}", params
+            ).fetchone()[0]
+            rows = conn.execute(
+                f"SELECT * FROM alerts {where} "
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                [*params, limit, offset],
+            ).fetchall()
+            return {"total": int(total), "items": [dict(row) for row in rows]}
+        finally:
+            conn.close()
+
+    def ack_alert(self, alert_id: int) -> dict[str, Any]:
+        """Acknowledge an open alert; state is judged at commit time.
+
+        Acknowledging never re-arms the alert's window: the window keeps its
+        ``alerted`` flag, so later hits in the same window stay silent and
+        only the next window can open a new alert.
+        """
+        with self._write_tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+            ).fetchone()
+            if row is None:
+                raise AlertNotFound(f"告警 #{alert_id} 不存在")
+            if row["status"] == "ack":
+                raise AlertAlreadyAcked(f"告警 #{alert_id} 已确认")
+            conn.execute(
+                "UPDATE alerts SET status = 'ack', acked_at = ? "
+                "WHERE id = ? AND status = 'open'",
+                (self._now(), alert_id),
+            )
+            updated = conn.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+            ).fetchone()
+            return dict(updated)
 
     # ---------------------------------------------------------------- search
     def search(
@@ -633,6 +992,9 @@ class IndexManager:
                 "SELECT * FROM index_generations ORDER BY id DESC LIMIT 1"
             ).fetchone()
             total_logs = conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0]
+            open_alerts = conn.execute(
+                "SELECT COUNT(*) FROM alerts WHERE status = 'open'"
+            ).fetchone()[0]
         finally:
             conn.close()
 
@@ -655,6 +1017,7 @@ class IndexManager:
             "latest": dict(latest) if latest else None,
             "progress": progress,
             "total_logs": int(total_logs),
+            "open_alerts": int(open_alerts),
         }
 
     def services(self) -> list[dict[str, Any]]:

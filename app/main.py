@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
@@ -13,7 +13,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
-from .indexer import IndexManager, IndexUnavailable, RebuildInProgress
+from .indexer import (
+    AlertAlreadyAcked,
+    AlertNotFound,
+    IndexManager,
+    IndexUnavailable,
+    RebuildInProgress,
+    RuleExists,
+)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -23,6 +30,15 @@ class LogIn(BaseModel):
 
     service: str = Field(min_length=1, max_length=100)
     body: str = Field(min_length=1, max_length=20_000)
+
+
+class RuleIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    service: str = Field(min_length=1, max_length=100)
+    keyword: str = Field(min_length=1, max_length=500)
+    window_seconds: int = Field(ge=1, le=86_400)
+    threshold: int = Field(ge=1, le=100_000)
 
 
 def create_app(db_path: str | None = None, *, manager: IndexManager | None = None) -> FastAPI:
@@ -80,6 +96,55 @@ def create_app(db_path: str | None = None, *, manager: IndexManager | None = Non
     async def list_services():
         idx = get_manager()
         return {"items": await run_in_threadpool(idx.services)}
+
+    @app.post("/api/rules", status_code=201)
+    async def create_rule(payload: RuleIn):
+        idx = get_manager()
+        try:
+            return await run_in_threadpool(
+                idx.create_rule,
+                payload.service,
+                payload.keyword,
+                payload.window_seconds,
+                payload.threshold,
+            )
+        except RuleExists as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/rules")
+    async def list_rules():
+        idx = get_manager()
+        return {"items": await run_in_threadpool(idx.list_rules)}
+
+    @app.delete("/api/rules/{rule_id}", status_code=204)
+    async def delete_rule(rule_id: int):
+        idx = get_manager()
+        if not await run_in_threadpool(idx.delete_rule, rule_id):
+            raise HTTPException(status_code=404, detail="规则不存在")
+
+    @app.get("/api/alerts")
+    async def list_alerts(
+        status: Annotated[Literal["open", "ack", "all"], Query()] = "open",
+        limit: Annotated[int, Query(ge=1, le=200)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ):
+        idx = get_manager()
+        status_filter = None if status == "all" else status
+        return await run_in_threadpool(
+            idx.list_alerts, status_filter, limit=limit, offset=offset
+        )
+
+    @app.post("/api/alerts/{alert_id}/ack")
+    async def ack_alert(alert_id: int):
+        idx = get_manager()
+        try:
+            return await run_in_threadpool(idx.ack_alert, alert_id)
+        except AlertNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AlertAlreadyAcked as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/reindex", status_code=202)
     async def start_reindex():

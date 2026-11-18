@@ -51,6 +51,15 @@ function renderStatus(status) {
   } else {
     box.innerHTML = `<span class="dot ok"></span>索引就绪 #${active.id}`;
   }
+  if (status.open_alerts > 0) {
+    const warn = document.createElement("span");
+    warn.className = "open-alert-flag";
+    warn.textContent = `未确认告警 ${status.open_alerts} 条`;
+    box.appendChild(warn);
+  }
+  const badge = $("open-alert-badge");
+  badge.hidden = !status.open_alerts;
+  badge.textContent = String(status.open_alerts || 0);
 
   const add = (label, value) => {
     const dt = document.createElement("dt");
@@ -148,6 +157,157 @@ async function refreshStatus() {
   }
 }
 
+// ------------------------------------------------------------------ alerts
+function renderRules(rules) {
+  const list = $("rules");
+  list.textContent = "";
+  if (rules.length === 0) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "尚未登记告警规则。";
+    list.appendChild(li);
+    return;
+  }
+  for (const rule of rules) {
+    const li = document.createElement("li");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const svc = document.createElement("span");
+    svc.className = "service";
+    svc.textContent = rule.service;
+    const desc = document.createElement("span");
+    desc.textContent =
+      `关键词「${rule.keyword}」 · ${rule.window_seconds} 秒内命中 ` +
+      `${rule.threshold} 条开单 · 登记于 ${fmtTime(rule.created_at)}`;
+    const del = document.createElement("button");
+    del.className = "small ghost";
+    del.textContent = "删除";
+    del.addEventListener("click", async () => {
+      if (!window.confirm(`删除服务 ${rule.service} 的告警规则？已开的告警会保留。`)) {
+        return;
+      }
+      try {
+        await call("DELETE", `/api/rules/${rule.id}`);
+        $("rule-hint").textContent = `已删除服务 ${rule.service} 的规则。`;
+        void loadRules();
+      } catch (error) {
+        $("rule-hint").textContent = `删除失败：${error.message}`;
+      }
+    });
+    meta.append(svc, desc, del);
+    li.appendChild(meta);
+    list.appendChild(li);
+  }
+}
+
+async function loadRules() {
+  try {
+    const data = await call("GET", "/api/rules");
+    renderRules(data.items);
+  } catch (_) {
+    /* rule list is refreshed again shortly */
+  }
+}
+
+function renderAlerts(data, showAll) {
+  const list = $("alerts");
+  list.textContent = "";
+  const items = data.items;
+  if (items.length === 0) {
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = showAll ? "没有任何告警。" : "没有未确认的告警。";
+    list.appendChild(li);
+  }
+  for (const alert of items) {
+    const li = document.createElement("li");
+    if (alert.status === "open") li.classList.add("open");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const svc = document.createElement("span");
+    svc.className = "service";
+    svc.textContent = alert.service;
+    const state = document.createElement("span");
+    state.className = alert.status === "open" ? "alert-state open" : "alert-state";
+    state.textContent = alert.status === "open" ? "未确认" : "已确认";
+    const time = document.createElement("span");
+    time.textContent = `开单 ${fmtTime(alert.opened_at)}`;
+    meta.append(svc, state, time);
+    const body = document.createElement("div");
+    body.className = "alert-body";
+    body.textContent =
+      `关键词「${alert.keyword}」在 ${alert.window_seconds} 秒窗口内命中 ` +
+      `${alert.hit_count} 条（门槛 ${alert.threshold} 条），` +
+      `窗口起于 ${fmtTime(alert.window_start)}` +
+      (alert.acked_at ? `，确认于 ${fmtTime(alert.acked_at)}` : "");
+    li.append(meta, body);
+    if (alert.status === "open") {
+      const ack = document.createElement("button");
+      ack.className = "small";
+      ack.textContent = "确认";
+      ack.addEventListener("click", async () => {
+        ack.disabled = true;
+        try {
+          await call("POST", `/api/alerts/${alert.id}/ack`);
+          void loadAlerts();
+          void refreshStatus();
+        } catch (error) {
+          $("alerts-hint").textContent = `确认失败：${error.message}`;
+          ack.disabled = false;
+        }
+      });
+      li.appendChild(ack);
+    }
+    list.appendChild(li);
+  }
+}
+
+async function loadAlerts() {
+  const showAll = $("alerts-show-all").checked;
+  const status = showAll ? "all" : "open";
+  try {
+    const data = await call("GET", `/api/alerts?status=${status}&limit=100`);
+    renderAlerts(data, showAll);
+    if (!showAll) {
+      $("alerts-hint").textContent =
+        data.total > data.items.length
+          ? `共 ${data.total} 条未确认，仅显示最近 ${data.items.length} 条。`
+          : "达到触发条数时每个窗口只开一条告警。";
+    }
+  } catch (error) {
+    $("alerts-hint").textContent = `无法获取告警：${error.message}`;
+  }
+}
+
+$("alerts-show-all").addEventListener("change", () => {
+  void loadAlerts();
+});
+
+$("rule-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("submit-rule");
+  const hint = $("rule-hint");
+  button.disabled = true;
+  hint.textContent = "登记中…";
+  try {
+    const rule = await call("POST", "/api/rules", {
+      service: $("rule-service").value,
+      keyword: $("rule-keyword").value,
+      window_seconds: Number($("rule-window").value),
+      threshold: Number($("rule-threshold").value),
+    });
+    hint.textContent =
+      `已登记：${rule.service} 在 ${rule.window_seconds} 秒内命中 ` +
+      `「${rule.keyword}」${rule.threshold} 条时开单。`;
+    $("rule-keyword").value = "";
+    void loadRules();
+  } catch (error) {
+    hint.textContent = `登记失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("log-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const button = $("submit-log");
@@ -208,5 +368,9 @@ $("rebuild-button").addEventListener("click", async () => {
 
 void refreshStatus();
 void loadServices();
+void loadRules();
+void loadAlerts();
 setInterval(refreshStatus, 1000);
+setInterval(loadAlerts, 2000);
 setInterval(loadServices, 15000);
+setInterval(loadRules, 15000);

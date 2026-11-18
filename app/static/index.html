@@ -13,6 +13,40 @@
   </header>
 
   <main>
+    <section class="card" id="alerts-card">
+      <h2>告警 <span class="badge" id="open-alert-badge" hidden>0</span></h2>
+      <div class="row">
+        <label class="inline-check">
+          <input type="checkbox" id="alerts-show-all"> 显示已确认
+        </label>
+        <span class="hint" id="alerts-hint">达到触发条数时每个窗口只开一条告警。</span>
+      </div>
+      <ol id="alerts" class="results alerts"></ol>
+    </section>
+
+    <section class="card">
+      <h2>告警规则</h2>
+      <form id="rule-form">
+        <div class="rule-grid">
+          <label>服务名
+            <input name="service" id="rule-service" list="service-list" required maxlength="100" placeholder="例如 auth-api" autocomplete="off">
+          </label>
+          <label>关键词
+            <input name="keyword" id="rule-keyword" required maxlength="500" placeholder="例如 error 或 登录失败" autocomplete="off">
+          </label>
+          <label>窗口秒数
+            <input name="window" id="rule-window" type="number" min="1" max="86400" value="60" required>
+          </label>
+          <label>触发条数
+            <input name="threshold" id="rule-threshold" type="number" min="1" max="100000" value="5" required>
+          </label>
+          <button type="submit" id="submit-rule">登记规则</button>
+        </div>
+        <span class="hint" id="rule-hint">每个服务登记一条规则，只统计登记后提交的日志；关键词与检索使用同一匹配规则。</span>
+      </form>
+      <ol id="rules" class="results"></ol>
+    </section>
+
     <section class="card">
       <h2>录入日志</h2>
       <form id="log-form">

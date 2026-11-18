@@ -179,6 +179,108 @@ def test_failed_rebuild_reports_error_and_keeps_serving(server):
     server.wait_active_changed(old)
 
 
+def test_alert_rule_flow_over_http(server):
+    assert server.client.post(
+        "/api/rules",
+        json={"service": "auth-api", "keyword": "登录失败", "window_seconds": 300, "threshold": 3},
+    ).status_code == 201
+    # One rule per service.
+    duplicate = server.client.post(
+        "/api/rules",
+        json={"service": "auth-api", "keyword": "error", "window_seconds": 60, "threshold": 1},
+    )
+    assert duplicate.status_code == 409
+    # Keyword must be usable by the search matcher.
+    bad = server.client.post(
+        "/api/rules",
+        json={"service": "other", "keyword": "!!!", "window_seconds": 60, "threshold": 1},
+    )
+    assert bad.status_code == 400
+    bad_threshold = server.client.post(
+        "/api/rules",
+        json={"service": "other", "keyword": "error", "window_seconds": 60, "threshold": 0},
+    )
+    assert bad_threshold.status_code == 422
+
+    rules = server.client.get("/api/rules").json()["items"]
+    assert len(rules) == 1
+    assert rules[0]["service"] == "auth-api"
+    assert rules[0]["start_log_id"] == 0
+
+    # Below the threshold: no alert.
+    for _ in range(2):
+        server.client.post("/api/logs", json={"service": "auth-api", "body": "用户登录失败"})
+    assert server.client.get("/api/alerts", params={"status": "open"}).json()["total"] == 0
+    # Crossing it opens exactly one alert; extra hits in the window stay silent.
+    server.client.post("/api/logs", json={"service": "auth-api", "body": "用户登录失败"})
+    server.client.post("/api/logs", json={"service": "auth-api", "body": "用户登录失败"})
+    open_alerts = server.client.get("/api/alerts", params={"status": "open"}).json()
+    assert open_alerts["total"] == 1
+    alert = open_alerts["items"][0]
+    assert alert["hit_count"] == 3
+    assert alert["keyword"] == "登录失败"
+    assert server.client.get("/api/status").json()["open_alerts"] == 1
+
+    # Acknowledge it; a second ack is rejected by state.
+    acked = server.client.post(f"/api/alerts/{alert['id']}/ack")
+    assert acked.status_code == 200
+    assert acked.json()["status"] == "ack"
+    assert server.client.post(f"/api/alerts/{alert['id']}/ack").status_code == 409
+    assert server.client.post("/api/alerts/9999/ack").status_code == 404
+    assert server.client.get("/api/status").json()["open_alerts"] == 0
+    # Same window stays silent after acknowledgment.
+    server.client.post("/api/logs", json={"service": "auth-api", "body": "用户登录失败"})
+    every = server.client.get("/api/alerts", params={"status": "all"}).json()
+    assert every["total"] == 1
+    assert every["items"][0]["status"] == "ack"
+    assert server.client.get("/api/alerts", params={"status": "bogus"}).status_code == 422
+
+    # Deleting the rule stops alerting but keeps the ticket.
+    assert server.client.delete(f"/api/rules/{rules[0]['id']}").status_code == 204
+    assert server.client.delete(f"/api/rules/{rules[0]['id']}").status_code == 404
+    server.client.post("/api/logs", json={"service": "auth-api", "body": "用户登录失败"})
+    assert server.client.get("/api/alerts", params={"status": "all"}).json()["total"] == 1
+
+
+def test_alerts_survive_rebuild_with_interleaved_writes_over_http(server):
+    server.client.post(
+        "/api/rules",
+        json={"service": "pay", "keyword": "支付超时", "window_seconds": 3600, "threshold": 5},
+    )
+    for i in range(3):
+        server.client.post("/api/logs", json={"service": "pay", "body": f"支付超时 pre{i}"})
+    assert server.client.get("/api/alerts").json()["total"] == 0
+    old = server.client.get("/api/status").json()["active"]["id"]
+
+    held = threading.Event()
+    seen = threading.Event()
+
+    def hook(event, payload):
+        if event == "batch":
+            seen.set()
+            held.wait(10)
+
+    server.manager.build_hook = hook
+    assert server.client.post("/api/reindex").status_code == 202
+    assert seen.wait(5)
+    # Writes committed during the rebuild cross the threshold.
+    for i in range(4):
+        server.client.post("/api/logs", json={"service": "pay", "body": f"支付超时 mid{i}"})
+    # The alert opened exactly once, while the old index was still serving.
+    open_alerts = server.client.get("/api/alerts").json()
+    assert open_alerts["total"] == 1
+    assert open_alerts["items"][0]["hit_count"] == 5
+    held.set()
+    server.wait_active_changed(old)
+
+    # The rebuild did not re-evaluate rules: still exactly one alert, and
+    # every log is searchable in the new index.
+    assert server.client.get("/api/alerts", params={"status": "all"}).json()["total"] == 1
+    found = server.client.get("/api/logs", params={"q": "支付超时", "limit": 200}).json()
+    assert found["total"] == 7
+    assert found["generation"]["id"] != old
+
+
 def test_restart_via_lifespan_keeps_old_index(tmp_path):
     """New process instance over the same DB keeps the last complete index."""
     manager = IndexManager(str(tmp_path / "restart.db"))
